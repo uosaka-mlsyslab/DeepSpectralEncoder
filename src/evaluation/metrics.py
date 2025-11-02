@@ -1,8 +1,11 @@
 """
-評価指標計算
+評価指標計算モジュール
 
-DFIV Kalman Filter性能評価指標を提供:
-推定精度(MSE/MAE/RMSE), 不確実性定量化(カバレッジ率), 予測性能(尤度), 計算効率(時間/メモリ)
+DFIV Kalman Filterの状態推定性能を包括的に評価するための指標を提供。
+- 推定精度（MSE, MAE, RMSE）
+- 不確実性定量化品質（カバレッジ率、区間幅）
+- 予測性能（対数尤度、キャリブレーション）
+- 計算効率（時間、メモリ）
 """
 
 import torch
@@ -33,16 +36,18 @@ class StateEstimationMetrics:
         verbose: bool = True
     ) -> Dict[str, Union[float, Dict]]:
         """
-        包括的評価指標計算
-
+        包括的評価指標の計算
+        
         Args:
-            X_estimated: 推定状態 (T,r)
-            X_true: 真値 (T,r)
-            X_covariances: 共分散 (T,r,r)
-            observations: 観測 (T,n)
-            likelihoods: 尤度 (T,)
-            verbose: 詳細出力
-        Returns: 全評価指標
+            X_estimated: 推定状態 (T, r)
+            X_true: 真の状態 (T, r) [optional]
+            X_covariances: 状態共分散 (T, r, r) [optional]
+            observations: 観測データ (T, n) [optional]
+            likelihoods: 観測尤度 (T,) [optional]
+            verbose: ターミナル出力するかどうか
+            
+        Returns:
+            Dict: 全評価指標
         """
         metrics = {}
         
@@ -148,7 +153,7 @@ class StateEstimationMetrics:
         X_true: torch.Tensor,
         confidence_levels: List[float] = [0.68, 0.95, 0.99]
     ) -> Dict[str, float]:
-        """信頼区間カバレッジ率計算"""
+        """信頼区間カバレッジ率"""
         coverage_results = {}
         
         for conf_level in confidence_levels:
@@ -465,14 +470,23 @@ class TargetPredictionMetrics:
         verbose: bool = True
     ) -> Dict[str, Union[float, List[float]]]:
         """
-        ターゲット予測評価指標計算
+        ターゲット予測評価指標計算（既存メトリクスと統一インターフェース）
 
         Args:
-            y_true: 真値 (T,d)
-            y_pred: 予測 (T,d)
-            metrics: 指標リスト ['rmse','mae','r2','r2_per_dim']
-            verbose: 詳細出力
-        Returns: 評価指標Dict
+            y_true: 真値テンソル (T, d)
+            y_pred: 予測値テンソル (T, d)
+            metrics: 計算する指標のリスト ['rmse', 'mae', 'r2', 'r2_per_dim']
+            verbose: ターミナル出力するかどうか
+
+        Returns:
+            Dict: 評価指標結果
+
+        例:
+            target_evaluator = TargetPredictionMetrics()
+            metrics = target_evaluator.compute_target_metrics(
+                y_true, y_pred, metrics=['rmse', 'mae'], verbose=True
+            )
+            # {'rmse': 0.1234, 'mae': 0.0987}
         """
         # 入力検証
         if y_true.shape != y_pred.shape:
@@ -515,13 +529,15 @@ class TargetPredictionMetrics:
         experiment_info: Optional[Dict[str, Any]] = None
     ) -> str:
         """
-        評価結果JSON保存
+        ターゲット予測評価結果をJSONファイルに保存
 
         Args:
-            results: compute_target_metrics()結果
-            output_dir: 出力先
-            experiment_info: 実験情報
-        Returns: 保存ファイルパス
+            results: compute_target_metrics()の結果
+            output_dir: 出力ディレクトリ
+            experiment_info: 追加の実験情報（オプション）
+
+        Returns:
+            保存されたファイルパス
         """
         import json
         from datetime import datetime
@@ -555,14 +571,22 @@ class TargetPredictionMetrics:
         output_dir: Optional[str] = None
     ) -> List[str]:
         """
-        予測可視化
+        ターゲット予測可視化（既存パターンと統一）
 
         Args:
-            y_true: 真値
-            y_pred: 予測
-            metrics: 指標リスト
-            output_dir: 出力先
-        Returns: 生成ファイルパスリスト
+            y_true: 真値テンソル
+            y_pred: 予測値テンソル
+            metrics: 可視化する指標リスト
+            output_dir: 出力ディレクトリ（Noneの場合は保存しない）
+
+        Returns:
+            List[str]: 生成されたファイルパスのリスト
+
+        生成ファイル例:
+            - target_prediction_rmse.png
+            - target_prediction_mae.png
+            - target_prediction_r2.png
+            - target_prediction_r2_per_dim.png
         """
         # TODO: 実装検討中
         # 可視化機能は一旦無効化し、数値出力・保存のみに変更

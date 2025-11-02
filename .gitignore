@@ -7,6 +7,7 @@ __pycache__/
 .ipynb_checkpoints/
 _prompt/
 _tests/
+results/
 HANDOVER_TECHNICAL_GUIDE.md
 COMPREHENSIVE_HANDOVER_GUIDE.md
 DFIV_FORMULATION.md
@@ -14,31 +15,15 @@ _myzipper.py
 test_*.py
 test_*.json
 debug_*.py
+generate_series.py
 
 .vscode
 
-
-#生成物
-results/
-.pytest_cache
+# 生成物
 checkpoints/
 experiments/
 
-#未使用
-generate_series.py
-scripts/compare_estimation_methods.py
-scripts/evaluate_filtering_performance.py
-scripts/generate_sim_data.py
-scripts/preprocess_ett.py
-scripts/run_filtering_evaluation.py
-.ipynb_checkpoints/
-src/models/architectures/time_invariant.py
-src/models/architectures/tcn.py
+# 一時的設定
+main_proposed_method.py
+main_two_stage.py
 
-#共有不要
-configs/evaluation_config.yaml
-configs/filtering_evaluation_config.yaml
-configs/filtering_evaluation_config_template.yaml
-configs/full_experiment_config.yaml
-configs/template_reconstruction_config.yaml
-configs/template_target_prediction_config.yaml

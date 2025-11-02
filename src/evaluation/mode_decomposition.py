@@ -1,8 +1,15 @@
 """
-モード分解・スペクトル分析
+モード分解・スペクトル分析モジュール
 
-Koopman作用素理論に基づくDFIVスペクトル解析:
-固有値・連続時間変換, 真値MSE評価, V_A抽出, 結果保存(JSON/NPZ)
+Koopman作用素理論に基づくDFIVスペクトル解析を提供。
+学習済みV_A行列から固有値・モード分解を実行し、
+連続時間スペクトル特性を抽出する。
+
+実装機能:
+- 基本スペクトル分析：固有値・連続時間変換
+- 真値との MSE 評価（利用可能時）
+- 学習済みモデルからのV_A抽出
+- 結果保存（JSON, NPZ形式）
 """
 
 import torch
@@ -15,29 +22,36 @@ from pathlib import Path
 
 class SpectrumAnalyzer:
     """
-    Koopmanスペクトル分析
+    Koopmanスペクトル分析クラス
 
-    V_A行列から固有値分解・連続時間スペクトル特性抽出。
-    離散→連続時間固有値変換を含む。
+    V_A行列からの固有値分解と連続時間スペクトル特性の抽出を実行。
+    離散時間固有値から連続時間固有値への変換も含む。
     """
 
     def __init__(self, sampling_interval: float):
         """
         Args:
-            sampling_interval: サンプリング間隔Δt
+            sampling_interval: サンプリング間隔 Δt (連続時間変換用)
         """
         self.dt = sampling_interval
 
     def analyze_spectrum(self, V_A: torch.Tensor) -> Dict[str, Any]:
         """
-        V_Aスペクトル分析
+        V_A からのスペクトル分析
 
         Args:
-            V_A: 転送作用素 (d_A,d_A)
+            V_A: 転送作用素行列 (d_A, d_A)
+
         Returns:
-            eigenvalues_discrete(λ), eigenvalues_continuous(μ),
-            growth_rates(Re(μ)), frequencies_hz(Im(μ)/(2π)),
-            dominant/stable indices, magnitude(|λ|), phase(arg(λ))
+            Dict: スペクトル分析結果
+                - eigenvalues_discrete: λ ∈ C^{d_A} (離散時間固有値)
+                - eigenvalues_continuous: μ ∈ C^{d_A} (連続時間固有値)
+                - growth_rates: Re(μ) (成長率/減衰率)
+                - frequencies_hz: Im(μ)/(2π) (振動周波数 Hz)
+                - dominant_indices: 主要モードインデックス
+                - stable_indices: 安定モードインデックス
+                - eigenvalues_magnitude: |λ| (離散時間振幅)
+                - eigenvalues_phase: arg(λ) (離散時間位相)
         """
         # デバイス・形状情報をログ出力（デバッグ用）
         print(f"📋 V_A分析開始: shape={V_A.shape}, device={V_A.device}, dtype={V_A.dtype}")
@@ -89,11 +103,15 @@ class SpectrumAnalyzer:
         eigenvalues_discrete: torch.Tensor
     ) -> torch.Tensor:
         """
-        離散→連続時間固有値変換: μ = (1/Δt)*log(λ)
+        離散時間固有値から連続時間固有値への変換
+
+        μ = (1/Δt) * log(λ)
 
         Args:
-            eigenvalues_discrete: λ ∈ C^{d_A}
-        Returns: μ ∈ C^{d_A}
+            eigenvalues_discrete: 離散時間固有値 λ ∈ C^{d_A}
+
+        Returns:
+            torch.Tensor: 連続時間固有値 μ ∈ C^{d_A}
         """
         # log計算（ゼロ近似の場合の数値安定性考慮）
         eigenvalues_log = torch.log(eigenvalues_discrete + 1e-12)
@@ -107,12 +125,14 @@ class SpectrumAnalyzer:
         threshold: float = 0.1
     ) -> List[int]:
         """
-        主要モード特定
+        主要モードの特定
 
         Args:
-            eigenvalues_magnitude: |λ|
-            threshold: スペクトル半径比率閾値
-        Returns: 主要モードindex
+            eigenvalues_magnitude: 固有値の絶対値 |λ|
+            threshold: 閾値（スペクトル半径に対する比率）
+
+        Returns:
+            List[int]: 主要モードのインデックス
         """
         spectral_radius = torch.max(eigenvalues_magnitude)
         dominant_mask = eigenvalues_magnitude > threshold * spectral_radius
