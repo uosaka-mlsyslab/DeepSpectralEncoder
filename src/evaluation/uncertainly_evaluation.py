@@ -1,8 +1,10 @@
 """
-不確実性評価
+不確実性評価モジュール
 
-DFIV Kalman Filter不確実性定量化品質評価:
-信頼区間品質, キャリブレーション, 妥当性検証
+DFIV Kalman Filterの不確実性定量化品質を詳細に評価。
+- 信頼区間の品質評価
+- キャリブレーション分析
+- 不確実性の妥当性検証
 """
 
 import torch
@@ -31,15 +33,17 @@ class UncertaintyEvaluator:
         verbose: bool = True
     ) -> Dict[str, Union[float, Dict, List]]:
         """
-        不確実性品質包括評価
-
+        不確実性品質の包括的評価
+        
         Args:
-            predictions: 予測 (T,d)
-            uncertainties: 標準偏差 (T,d)
-            true_values: 真値 (T,d)
-            save_plots: プロット保存
-            verbose: 詳細出力
-        Returns: 評価結果
+            predictions: 予測値 (T, d)
+            uncertainties: 不確実性（標準偏差） (T, d)
+            true_values: 真値 (T, d) [optional]
+            save_plots: プロット保存するか
+            verbose: 詳細出力するか
+            
+        Returns:
+            Dict: 不確実性評価結果
         """
         if verbose:
             print("\n🎲 不確実性定量化評価開始")

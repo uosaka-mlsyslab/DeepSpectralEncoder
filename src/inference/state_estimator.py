@@ -98,46 +98,87 @@ class StateEstimator:
     def load_components(self, model_path: Union[str, Path]):
         """
         個別コンポーネントの読み込み
-        
+
         DF-A, DF-B, エンコーダから演算子を抽出
-        
+
         Args:
             model_path: 学習済みモデルパス
         """
         model_path = Path(model_path)
-        
+
         try:
             # モデル状態読み込み
             checkpoint = torch.load(model_path, map_location=self.device)
-            
-            # 各コンポーネントの状態辞書取得
-            state_dict = checkpoint.get('model_state_dict', checkpoint)
-            
+
+            # checkpoint['config']から学習時設定を取得
+            training_config = checkpoint.get('config', {})
+
+            # エンコーダタイプを取得
+            encoder_type = training_config.get('model', {}).get('encoder', {}).get('type')
+
+            # 次元情報を更新
+            self._update_config_from_checkpoint(training_config)
+
+            # 各コンポーネントの状態辞書取得（checkpointから直接）
+            state_dict = checkpoint
+
             # DF-A コンポーネント
             if 'df_state' in state_dict:
                 self._load_df_state_component(state_dict['df_state'])
             else:
                 raise KeyError("DF-A component not found in model")
-                
-            # DF-B コンポーネント  
+
+            # DF-B コンポーネント
             if 'df_obs' in state_dict:
                 self._load_df_obs_component(state_dict['df_obs'])
             else:
                 raise KeyError("DF-B component not found in model")
-                
-            # エンコーダ
+
+            # エンコーダ（タイプ情報付き）
             if 'encoder' in state_dict:
-                self._load_encoder_component(state_dict['encoder'])
+                self._load_encoder_component(state_dict['encoder'], encoder_type=encoder_type)
             else:
                 raise KeyError("Encoder component not found in model")
-                
+
             # 転送作用素抽出
             self._extract_operators()
-            
+
             print(f"Successfully loaded components from {model_path}")
-            
+
         except Exception as e:
             raise RuntimeError(f"Failed to load model components: {e}")
+
+    def _update_config_from_checkpoint(self, training_config: Dict[str, Any]):
+        """checkpointから設定を更新"""
+        if not training_config:
+            return
+
+        # モデル設定を更新
+        if 'model' not in self.config:
+            self.config['model'] = {}
+
+        # エンコーダ設定
+        if 'encoder' in training_config.get('model', {}):
+            self.config['model']['encoder'] = training_config['model']['encoder']
+
+        # DF-A設定
+        if 'ssm' in training_config and 'df_state' in training_config['ssm']:
+            if 'df_state' not in self.config.get('model', {}):
+                self.config['model']['df_state'] = {}
+            df_state_cfg = training_config['ssm']['df_state']
+            self.config['model']['df_state'].update({
+                'feature_dim': df_state_cfg.get('feature_dim'),
+                'state_dim': training_config['ssm']['realization'].get('rank')
+            })
+
+        # DF-B設定
+        if 'ssm' in training_config and 'df_observation' in training_config['ssm']:
+            if 'df_obs' not in self.config.get('model', {}):
+                self.config['model']['df_obs'] = {}
+            df_obs_cfg = training_config['ssm']['df_observation']
+            self.config['model']['df_obs'].update({
+                'obs_feature_dim': df_obs_cfg.get('obs_feature_dim')
+            })
 
     def _flatten_nested_state_dict(self, nested_dict: Dict[str, Any]) -> Dict[str, Any]:
         """ネストしたstate_dictを平坦化"""
@@ -194,29 +235,128 @@ class StateEstimator:
         self.df_obs_layer.load_state_dict(flattened_obs_dict, strict=False)
         self.df_obs_layer.eval()
 
-    def _load_encoder_component(self, encoder_dict: Dict[str, Any]):
-        """time_invariantエンコーダ読み込み"""
-        from ..models.architectures.time_invariant import time_invariantEncoder
+    def _load_encoder_component(self, encoder_dict: Dict[str, Any], encoder_type: str = None):
+        """
+        動的エンコーダ読み込み
 
-        encoder_config = self.config.get('model', {}).get('encoder', {})
+        Args:
+            encoder_dict: エンコーダのstate_dict
+            encoder_type: エンコーダタイプ（'rkn', 'time_invariant', 'tcn'等）
+                          Noneの場合はstate_dictから自動検出
+        """
+        # エンコーダタイプの決定
+        if encoder_type is None:
+            encoder_type = self._detect_encoder_type(encoder_dict)
 
-        # time_invariantエンコーダーのパラメータから構造を推定
-        input_dim = encoder_config.get('input_dim', 6)
-        output_dim = self._detect_time_invariant_output_dim(encoder_dict)
+        # Factory Patternを使用
+        from ..models.encoder import build_encoder
 
-        # print(f"DEBUG: time_invariant encoder - input_dim: {input_dim}, output_dim: {output_dim}")  # Resolved in Step 7
+        # エンコーダ設定の構築
+        encoder_config = self._build_encoder_config_from_state_dict(
+            encoder_dict, encoder_type
+        )
+        encoder_config['type'] = encoder_type
 
-        self.encoder = time_invariantEncoder(
-            input_dim=input_dim,
-            output_dim=output_dim,
-            architecture="mlp",  # デフォルト
-            normalize_input=True,
-            normalize_output=True,
-            track_running_stats=True
-        ).to(self.device)
+        # エンコーダ作成
+        self.encoder = build_encoder(encoder_config).to(self.device)
 
+        # state_dict読み込み
         self.encoder.load_state_dict(encoder_dict)
         self.encoder.eval()
+
+        print(f"✅ Loaded {encoder_type}Encoder successfully")
+
+    def _detect_encoder_type(self, encoder_dict: Dict[str, Any]) -> str:
+        """state_dictからエンコーダタイプを自動検出"""
+        keys = set(encoder_dict.keys())
+
+        # rknEncoder の特徴的なキー
+        if any('conv' in k for k in keys):
+            return 'rkn'
+
+        # time_invariantEncoder の特徴的なキー
+        if any('core_net' in k for k in keys):
+            return 'time_invariant'
+
+        # tcnEncoder の特徴的なキー
+        if any('temporal' in k for k in keys):
+            return 'tcn'
+
+        # デフォルト
+        return 'time_invariant'
+
+    def _build_encoder_config_from_state_dict(
+        self,
+        encoder_dict: Dict[str, Any],
+        encoder_type: str
+    ) -> Dict[str, Any]:
+        """state_dictからエンコーダ設定を復元"""
+
+        if encoder_type == 'rkn':
+            # rknEncoder の設定を推定
+            # conv1.weight の形状から input_resolution を推定
+            conv1_weight = encoder_dict.get('conv1.weight')
+            if conv1_weight is not None:
+                C = conv1_weight.shape[1]  # 入力チャネル数
+                # H, W は実行時データから決定（または config から取得）
+                config_from_checkpoint = self.config.get('model', {}).get('encoder', {})
+                input_resolution_from_cfg = config_from_checkpoint.get('input_resolution', [48, 48, 1])
+                if len(input_resolution_from_cfg) >= 2:
+                    H, W = input_resolution_from_cfg[:2]
+                else:
+                    H, W = 48, 48  # デフォルト
+                input_resolution = [H, W, C]
+            else:
+                input_resolution = [48, 48, 1]  # デフォルト
+
+            # feature_dim を推定（fc_out.weight の形状から）
+            fc_out_weight = encoder_dict.get('fc_out.weight')
+            if fc_out_weight is not None:
+                feature_dim = fc_out_weight.shape[0]
+            else:
+                feature_dim = 50  # デフォルト
+
+            # conv_channels を推定
+            conv_channels = []
+            if 'conv1.weight' in encoder_dict:
+                conv_channels.append(encoder_dict['conv1.weight'].shape[0])
+            if 'conv2.weight' in encoder_dict:
+                conv_channels.append(encoder_dict['conv2.weight'].shape[0])
+
+            # hidden を推定（fc1.weight の形状から）
+            fc1_weight = encoder_dict.get('fc1.weight')
+            if fc1_weight is not None:
+                hidden = fc1_weight.shape[0]
+            else:
+                hidden = 200  # デフォルト
+
+            return {
+                'input_resolution': input_resolution,
+                'feature_dim': feature_dim,
+                'hidden': hidden,
+                'conv_channels': conv_channels if conv_channels else [32, 64],
+                'activation': 'relu',
+                'normalize_input': False,
+                'normalize_output': True,
+                'track_running_stats': True
+            }
+
+        elif encoder_type == 'time_invariant':
+            # 既存の _detect_time_invariant_output_dim() 等を使用
+            input_dim = self.config.get('model', {}).get('encoder', {}).get('input_dim', 6)
+            output_dim = self._detect_time_invariant_output_dim(encoder_dict)
+
+            return {
+                'input_dim': input_dim,
+                'output_dim': output_dim,
+                'architecture': 'mlp',
+                'normalize_input': True,
+                'normalize_output': True,
+                'track_running_stats': True
+            }
+
+        else:
+            raise ValueError(f"Unknown encoder type: {encoder_type}")
 
     def _detect_time_invariant_output_dim(self, encoder_dict: Dict[str, Any]) -> int:
         """time_invariantエンコーダーの出力次元を検出"""

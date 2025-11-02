@@ -278,9 +278,8 @@ class DFObservationLayer(nn.Module):
             cf_manager = CrossFittingManager(T_eff, n_blocks=n_blocks, min_block_size=min_block_size)
             cf_fitter = TwoStageCrossFitter(cf_manager)
 
-            # V_B推定（クロスフィッティング）- 勾配計算あり（θ更新用）
-            # 修正: no_grad()を削除し、_ridge_stage1_vb_with_gradを使用してθへの勾配を有効化
-            # 注: psi_currは呼び出し側でno_grad()内で計算済み（ω固定維持）
+            # V_B推定（クロスフィッティング、勾配あり）
+            # 注: psi_currはno_grad()で計算済み（ω固定）
             V_B_list = cf_fitter.cross_fit_stage1(
                 phi_prev, psi_curr,
                 stage1_estimator=lambda X, Y: self._ridge_stage1_vb_with_grad(X, Y, self.lambda_B)
@@ -439,9 +438,8 @@ class DFObservationLayer(nn.Module):
             cf_manager = CrossFittingManager(T_eff, n_blocks=n_blocks, min_block_size=min_block_size)
             cf_fitter = TwoStageCrossFitter(cf_manager)
 
-            # U_B推定（クロスフィッティング）- 勾配計算あり（ω更新用）
-            # 修正: no_grad()を削除し、_ridge_stage2_ub_matrix_with_gradを使用してωへの勾配を有効化
-            # 注: H_featuresは勾配計算ありで渡される（ω依存）
+            # U_B推定（クロスフィッティング、勾配あり）
+            # 注: H_featuresは勾配あり（ω依存）
             U_B_list = cf_fitter.cross_fit_stage2_matrix(
                 H_features, M_target,
                 stage2_estimator=lambda H, M: self._ridge_stage2_ub_matrix_with_grad(H, M, self.lambda_dB)
@@ -489,14 +487,29 @@ class DFObservationLayer(nn.Module):
         X_hat_states: torch.Tensor,
         m_features: torch.Tensor,
         optimizer_phi: torch.optim.Optimizer,
-        T1_iterations: int = 1,
-        fix_psi_omega: bool = True
+        fix_psi_omega: bool = True,
+        epoch: int = 0
     ) -> Dict[str, float]:
         """
-        **修正版**: Stage-1学習 + φ_θ勾配更新（時間検証付き）
+        Stage-1学習（エポックごとに1ブロック処理）
+
+        理論:
+        L_Stage-1(θ) = Σ_{t∈B_k} ||ψ_ω(m_t) - V_B^{(-k)} φ_θ(x̂_{t|t-1})||² + λ_B ||V_B^{(-k)}||²_F
+
+        注: ψ_ωは固定（fix_psi_omega=True）
+
+        Args:
+            X_hat_states: 状態予測系列 (T, r)
+            m_features: 多変量特徴量 (T, m)
+            optimizer_phi: φ_θ用オプティマイザ
+            fix_psi_omega: ψ_ωを固定するか
+            epoch: エポック番号
+
+        Returns:
+            Dict[str, float]: 損失メトリクス
         """
         T_x = X_hat_states.size(0)
-        
+
         # 多変量特徴量の次元チェック
         if m_features.dim() != 2:
             raise ValueError(f"多変量特徴量は2次元 (T, m): got {m_features.shape}")
@@ -504,9 +517,7 @@ class DFObservationLayer(nn.Module):
         if m_features.size(1) != self.multivariate_feature_dim:
             raise ValueError(f"特徴量次元不一致: expected {self.multivariate_feature_dim}, got {m_features.size(1)}")
 
-        # **修正: より詳細な時間検証**
         if T_x != m_features.size(0):
-            # デバッグ情報付きエラー
             error_details = {
                 "X_hat_states_shape": tuple(X_hat_states.shape),
                 "m_features_shape": tuple(m_features.shape),
@@ -517,95 +528,157 @@ class DFObservationLayer(nn.Module):
                 f"詳細: {error_details}. "
                 f"ヒント: 時間インデックス調整が必要です。"
             )
-        
+
         if T_x < 2:
             raise ValueError(f"系列が短すぎます: T={T_x}")
-        
-        # **修正: ψ_ω パラメータの固定処理**
+
+        # ψ_ω パラメータの固定処理
         psi_original_states = {}
         if fix_psi_omega:
             psi_original_states = self._freeze_parameters(self.psi_omega)
-        
-        total_loss = 0.0
-        
-        try:
-            # **修正: 反復回数制御とretain_graph管理**
-            for t in range(T1_iterations):
-                optimizer_phi.zero_grad()
-                
-                # 操作変数特徴量（各反復で新しい計算グラフ）
-                phi_instrument = self.phi_theta(X_hat_states)  # (T, d_A)
-                
-                # 観測特徴量（多変量対応）
-                if fix_psi_omega:
-                    # ψ_ω固定: 勾配計算なし
-                    with torch.no_grad():
-                        psi_obs = self.psi_omega(m_features)  # m_features: (T, m)
-                else:
-                    # ψ_ω更新: 勾配計算あり
-                    psi_obs = self.psi_omega(m_features)  # m_features: (T, m)
-                
-                # 時間合わせ
-                phi_prev = phi_instrument[:-1]  # (T-1, d_A)
-                psi_curr = psi_obs[1:]          # (T-1, d_B)
-                
-                # **理論準拠**: クロスフィッティングでV_B推定とout-of-fold予測
-                psi_pred, V_B = self._compute_cross_fitting_prediction_vb(phi_prev, psi_curr)
 
-                # 予測誤差（正規化済み） + V_B正則化項
-                prediction_loss = torch.norm(psi_pred - psi_curr, p='fro') ** 2 / psi_curr.numel()
+        try:
+            optimizer_phi.zero_grad()
+
+            # 操作変数特徴量（φ_θ使用、勾配あり）
+            phi_instrument = self.phi_theta(X_hat_states)  # (T, d_A)
+
+            # # 診断: φ(X_hat)統計量
+            # if not hasattr(self, '_phi_xhat_diag_logged'):
+            #     with torch.no_grad():
+            #         phi_mean = phi_instrument.abs().mean().item()
+            #         phi_std = phi_instrument.std().item()
+            #         phi_min = phi_instrument.min().item()
+            #         phi_max = phi_instrument.max().item()
+            #         print(f"[診断A-φ(X_hat)-epoch{epoch+1}] 範囲: [{phi_min:.3f}, {phi_max:.3f}], "
+            #               f"平均絶対値: {phi_mean:.3f}, 標準偏差: {phi_std:.3f}")
+            #     self._phi_xhat_diag_logged = True
+
+            # 観測特徴量（ψ_ω固定、勾配なし）
+            with torch.no_grad():
+                psi_obs = self.psi_omega(m_features)  # (T, d_B)
+
+            # 時間合わせ
+            phi_prev = phi_instrument[:-1]  # (T-1, d_A)
+            psi_curr = psi_obs[1:]          # (T-1, d_B)
+
+            T_eff = phi_prev.size(0)
+
+            # クロスフィッティング設定
+            n_blocks = self.cf_config.get('n_blocks', 5)
+            min_block_size = self.cf_config.get('min_block_size', 20)
+
+            # データ量チェック
+            if T_eff < max(n_blocks * min_block_size, 100):
+                # 小データ時：クロスフィッティングなし
+                V_B = self._ridge_stage1_vb_with_grad(phi_prev, psi_curr, self.lambda_B)
+                psi_pred = (V_B @ phi_prev.T).T
+
+                prediction_loss = torch.norm(psi_pred - psi_curr, p='fro') ** 2 / psi_curr.size(0)
                 regularization_loss = self.lambda_B * torch.norm(V_B, p='fro') ** 2
                 loss_stage1 = prediction_loss + regularization_loss
-                
-                total_loss += loss_stage1.item()
-                
-                # **修正: 計算グラフ管理**
-                if t < T1_iterations - 1:
-                    # 最後の反復以外: retain_graph=True
-                    loss_stage1.backward(retain_graph=True)
-                else:
-                    # 最後の反復: 完全解放
-                    loss_stage1.backward()
-                
-                # **修正: ψ_ω固定時の勾配クリア**
-                if fix_psi_omega:
-                    for param in self.psi_omega.parameters():
-                        if param.grad is not None:
-                            param.grad.zero_()
-                
+
+                loss_stage1.backward()
                 optimizer_phi.step()
-                
-                # **追加: 反復間のメモリクリア**
-                if t < T1_iterations - 1:
-                    phi_instrument = phi_instrument.detach()
-                    if not fix_psi_omega:
-                        psi_obs = psi_obs.detach()
-            
-            # Stage-1結果をキャッシュ（Stage-2用）
+
+                # キャッシュ更新（通常パスと同じパターン）
+                with torch.no_grad():
+                    self._stage1_cache = {
+                        'V_B': V_B,
+                        'phi_prev': phi_prev,
+                        'psi_curr': psi_curr,
+                        'X_hat': X_hat_states
+                    }
+
+                return {
+                    'stage1_loss': loss_stage1.item(),
+                    'n_blocks': 0,
+                    'mode': 'no_crossfitting'
+                }
+
+            # クロスフィッティング実行
+            from .cross_fitting import CrossFittingManager
+
+            cf_manager = CrossFittingManager(T_eff, n_blocks=n_blocks, min_block_size=min_block_size)
+
+            # エポックに対応するブロックを選択
+            k = epoch % cf_manager.n_blocks
+
+            optimizer_phi.zero_grad()
+
+            # 現在のφ_θで操作変数特徴量を計算
+            phi_instrument = self.phi_theta(X_hat_states)
+            phi_prev = phi_instrument[:-1]
+
+            # 観測特徴量（ψ_ω固定）
+            with torch.no_grad():
+                psi_obs = self.psi_omega(m_features)
+                psi_curr = psi_obs[1:]
+
+            # out-of-foldインデックス
+            oof_indices = cf_manager.get_out_of_fold_indices(k)
+            phi_prev_oof = phi_prev[oof_indices]
+            psi_curr_oof = psi_curr[oof_indices]
+
+            # V_B^{(-k)}計算
+            V_B_k = self._ridge_stage1_vb_with_grad(phi_prev_oof, psi_curr_oof, self.lambda_B)
+
+            # in-foldインデックス
+            block_indices = cf_manager.get_block_indices(k)
+            phi_prev_block = phi_prev[block_indices]
+            psi_curr_block = psi_curr[block_indices]
+
+            # 予測
+            psi_pred_block = (V_B_k @ phi_prev_block.T).T
+
+            # ブロックkの損失
+            prediction_loss_k = torch.norm(psi_pred_block - psi_curr_block, p='fro') ** 2 / psi_curr_block.size(0)
+            regularization_loss_k = self.lambda_B * torch.norm(V_B_k, p='fro') ** 2
+            loss_k = prediction_loss_k + regularization_loss_k
+
+            # # 診断: DF-B損失詳細・V_Bノルム
+            # if not hasattr(self, '_df_b_loss_logged'):
+            #     print(f"[診断-DF-B-S1-epoch{epoch+1}-Block{k}] 損失 - 予測: {prediction_loss_k.item():.6e}, "
+            #           f"正則化: {regularization_loss_k.item():.6e}")
+            #     print(f"[診断-DF-B-S1-epoch{epoch+1}-Block{k}] ψ_pred範囲: [{psi_pred_block.min().item():.3f}, "
+            #           f"{psi_pred_block.max().item():.3f}], ψ_curr範囲: [{psi_curr_block.min().item():.3f}, "
+            #           f"{psi_curr_block.max().item():.3f}]")
+            #     print(f"[診断-DF-B-S1-epoch{epoch+1}-Block{k}] ブロックサイズ: {psi_curr_block.size(0)}, "
+            #           f"特徴次元: {psi_curr_block.size(1)}")
+            #     self._df_b_loss_logged = True
+
+            loss_k.backward()
+            optimizer_phi.step()
+
+            # # 診断: V_Bノルム追跡
+            # with torch.no_grad():
+            #     V_B_norm = torch.norm(V_B_k, p='fro').item()
+            #     print(f"[診断D-V_B-epoch{epoch+1}] V_Bノルム: {V_B_norm:.2f}")
+
+            # キャッシュ更新
             with torch.no_grad():
                 phi_final = self.phi_theta(X_hat_states)
-                psi_final = self.psi_omega(m_features)  # m_features: (T, m)
-                
+                psi_final = self.psi_omega(m_features)
+
                 phi_prev_final = phi_final[:-1]
                 psi_curr_final = psi_final[1:]
                 V_B_final = self._ridge_stage1_vb(phi_prev_final, psi_curr_final, self.lambda_B)
-                
+
                 self._stage1_cache = {
-                    'V_B': V_B_final.detach(),
-                    'phi_prev': phi_prev_final.detach(),
-                    'psi_curr': psi_curr_final.detach(),
-                    'X_hat': X_hat_states.detach()
+                    'V_B': V_B_final,
+                    'phi_prev': phi_prev_final,
+                    'psi_curr': psi_curr_final,
+                    'X_hat': X_hat_states
                 }
-            
+
             return {
-                'stage1_loss': total_loss / T1_iterations,
-                'iterations_completed': T1_iterations,
-                'final_loss': loss_stage1.item(),
-                'time_alignment_verified': True  # **追加: 時間整合確認フラグ**
+                'stage1_loss': loss_k.item(),
+                'current_block': k,
+                'n_blocks': cf_manager.n_blocks
             }
-            
+
         finally:
-            # **修正: ψ_ω パラメータの復元**
+            # ψ_ω パラメータの復元
             if fix_psi_omega and psi_original_states:
                 self._restore_parameters(self.psi_omega, psi_original_states)
 
@@ -614,80 +687,131 @@ class DFObservationLayer(nn.Module):
             self,
             M_features: torch.Tensor,
             optimizer_psi: torch.optim.Optimizer,
-            fix_phi_theta: bool = True
+            fix_phi_theta: bool = True,
+            epoch: int = 0
         ) -> Dict[str, float]:
         """
-        **修正版**: Stage-2学習 + ψ_ω勾配更新（多変量特徴量対応）
+        Stage-2学習（エポックごとに1ブロック処理）
 
-        資料の学習戦略に対応:
-        U_B = 閉形式解(H^{(cf)}_B, M)        # U_B計算（φ_θ固定）
-        ψ_ω ← ψ_ω - α∇L2(U_B, ψ_ω)         # ψ_ω更新（φ_θ固定）
+        理論:
+        L_Stage-2(ω) = Σ_{t∈B_k} ||M_t - U_B^{(-k)}^T H_k||² + λ_{dB} ||U_B^{(-k)}||²_F
+
+        注: φ_θは固定（fix_phi_theta=True）
 
         Args:
             M_features: 多変量特徴量 (T, m)
             optimizer_psi: ψ_ω用オプティマイザ
-            fix_phi_theta: φ_θ を完全固定するか
+            fix_phi_theta: φ_θを固定するか
+            epoch: エポック番号
 
         Returns:
             Dict[str, float]: 損失メトリクス
         """
         if 'V_B' not in self._stage1_cache:
             raise RuntimeError("Stage-1が先に実行されている必要があります")
-        
-        # **修正**: φ_θ パラメータの完全固定
+
+        # φ_θ パラメータの固定処理
         phi_original_states = {}
         if fix_phi_theta:
             phi_original_states = self._freeze_parameters(self.phi_theta)
-        
+
         try:
-            # Stage-1からの結果を取得
-            V_B = self._stage1_cache['V_B']
+            # Stage-1からの結果取得
             phi_prev = self._stage1_cache['phi_prev']
             T_eff = phi_prev.size(0)
-            
-            # **修正3**: 境界チェック追加
+
+            # 境界チェック
             if M_features.size(0) < T_eff + 1:
                 raise RuntimeError(f"M_features長不足: required {T_eff+1}, got {M_features.size(0)}")
             M_curr = M_features[1:T_eff+1]  # (T-1, m)
 
-            # **修正**: Stage-2でψ_ω依存のV_B動的計算
-            # φ_θ: 固定値（キャッシュ）、ψ_ω: 現在値（勾配あり）
+            optimizer_psi.zero_grad()
+
+            # ψ_ω依存のV_B動的計算
             psi_obs_current = self.psi_omega(M_features)
             psi_curr_grad = psi_obs_current[1:T_eff+1]  # (T-1, d_B) 勾配あり
 
-            # V_B動的計算（ψ_ω勾配あり）
+            # V_B動的計算（ψ_ω勾配あり、φ_θ固定）
             V_B_current = self._ridge_stage1_vb_with_grad(phi_prev, psi_curr_grad, self.lambda_B)
 
             # H計算（ψ_ω勾配あり）
-            H = (V_B_current @ phi_prev.T).T  # (T-1, d_B) 勾配あり
+            H = (V_B_current @ phi_prev.T).T  # (T-1, d_B)
 
-            # **理論準拠**: クロスフィッティングでU_B推定とout-of-fold予測
-            M_pred, U_B = self._compute_cross_fitting_prediction_ub_matrix(H, M_curr)
+            # クロスフィッティング設定
+            n_blocks = self.cf_config.get('n_blocks', 5)
+            min_block_size = self.cf_config.get('min_block_size', 20)
 
-            # Stage-2 損失: 予測誤差（正規化済み） + U_B正則化項
-            prediction_loss = torch.norm(M_pred - M_curr, p='fro') ** 2 / M_curr.numel()
-            regularization_loss = self.lambda_dB * torch.norm(U_B, p='fro') ** 2
-            loss_stage2 = prediction_loss + regularization_loss
-            
-            # ψ_ω 更新（φ_θ は固定済み）
+            # データ量チェック
+            if T_eff < max(n_blocks * min_block_size, 100):
+                # 小データ時：クロスフィッティングなし
+                U_B = self._ridge_stage2_ub_matrix_with_grad(H, M_curr, self.lambda_dB)
+                M_pred = H @ U_B  # (T-1, m)
+
+                prediction_loss = torch.norm(M_pred - M_curr, p='fro') ** 2 / M_curr.size(0)
+                regularization_loss = self.lambda_dB * torch.norm(U_B, p='fro') ** 2
+                loss_stage2 = prediction_loss + regularization_loss
+
+                loss_stage2.backward()
+                optimizer_psi.step()
+
+                self._stage2_cache['U_B'] = U_B.detach()
+                return {'stage2_loss': loss_stage2.item(), 'n_blocks': 0, 'mode': 'no_crossfitting'}
+
+            # クロスフィッティング実行
+            from .cross_fitting import CrossFittingManager
+            cf_manager = CrossFittingManager(T_eff, n_blocks=n_blocks, min_block_size=min_block_size)
+
+            # エポックに対応するブロックを選択
+            k = epoch % cf_manager.n_blocks
+
             optimizer_psi.zero_grad()
-            loss_stage2.backward()
-            
-            # **修正**: 固定されたパラメータの勾配をゼロクリア（安全のため）
-            if fix_phi_theta:
-                for param in self.phi_theta.parameters():
-                    if param.grad is not None:
-                        param.grad.zero_()
-            
+
+            # 現在のψ_ωでHを計算
+            psi_obs_current = self.psi_omega(M_features)
+            psi_curr_grad = psi_obs_current[1:T_eff+1]
+            V_B_current = self._ridge_stage1_vb_with_grad(phi_prev, psi_curr_grad, self.lambda_B)
+            H = (V_B_current @ phi_prev.T).T
+
+            # out-of-foldでU_B^{(-k)}計算
+            oof_indices = cf_manager.get_out_of_fold_indices(k)
+            U_B_k = self._ridge_stage2_ub_matrix_with_grad(H[oof_indices], M_curr[oof_indices], self.lambda_dB)
+
+            # in-foldブロックで予測
+            block_indices = cf_manager.get_block_indices(k)
+            M_pred_k = H[block_indices] @ U_B_k
+
+            # ブロックkの損失
+            pred_loss_k = torch.norm(M_pred_k - M_curr[block_indices], p='fro') ** 2 / M_curr[block_indices].size(0)
+            reg_loss_k = self.lambda_dB * torch.norm(U_B_k, p='fro') ** 2
+            loss_k = pred_loss_k + reg_loss_k
+
+            # ブロックkでbackward
+            loss_k.backward()
+
+            # ブロックkで更新
             optimizer_psi.step()
-            
-            # U_B をキャッシュ
-            self._stage2_cache['U_B'] = U_B.detach()
-            
-            return {'stage2_loss': loss_stage2.item()}
-            
+
+            # 推論用キャッシュ更新（毎回全データで再計算、φ_θ・ψ_ω更新を反映）
+            with torch.no_grad():
+                X_hat_states = self._stage1_cache['X_hat']
+                phi_final = self.phi_theta(X_hat_states)
+                psi_final = self.psi_omega(M_features)
+                phi_prev_final = phi_final[:-1]
+                psi_curr_final = psi_final[1:T_eff+1]
+                V_B_final = self._ridge_stage1_vb(phi_prev_final, psi_curr_final, self.lambda_B)
+                H_final = (V_B_final @ phi_prev_final.T).T
+                M_curr_final = M_features[1:T_eff+1]
+                U_B_final = self._ridge_stage2_ub_matrix(H_final, M_curr_final, self.lambda_dB)
+                self._stage2_cache['U_B'] = U_B_final
+
+            return {
+                'stage2_loss': loss_k.item(),
+                'current_block': k,
+                'n_blocks': cf_manager.n_blocks
+            }
+
         finally:
-            # **修正1**: φ_θ パラメータの復元（psi_original_states削除）
+            # φ_θ パラメータの復元
             if fix_phi_theta and phi_original_states:
                 self._restore_parameters(self.phi_theta, phi_original_states)
     

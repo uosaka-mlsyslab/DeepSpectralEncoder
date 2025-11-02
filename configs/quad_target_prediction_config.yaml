@@ -1,6 +1,9 @@
+# ====================================================================
 # ターゲット予測実験用設定ファイル (run_full_experiment.py用)
+# 用途: クアッドコプター画像からの制御状態予測学習
 # データ: data/rkn_quad/quad1_y.npz (同じデータセット、ターゲット利用)
 # アーキテクチャ: rknEncoder + ZToStateMeanDecoder
+# ====================================================================
 
 # 実験モード設定（手動切り替え）
 experiment:
@@ -8,11 +11,11 @@ experiment:
 
 # データ設定
 data:
-  train_ratio: 0.7          # 学習データ比率 
-  val_ratio: 0.2            # 検証データ比率 
-  test_ratio: 0.1           # テストデータ比率 
-  normalization: "unit_scale"  # 画像正規化: 
-  batch_size: 300            # バッチサイズ 
+  train_ratio: 0.7          # 学習データ比率 (1050 images)
+  val_ratio: 0.2            # 検証データ比率 (300 images)
+  test_ratio: 0.1           # テストデータ比率 (150 images)
+  normalization: "unit_scale"  # 画像正規化: [0,255] → [0,1]
+  batch_size: 300            # バッチサイズ (画像用に小さめ)
   image_shape: [48, 48, 1]  # 画像形状 (H, W, C)
 
 # モデルアーキテクチャ設定 - RKN画像対応
@@ -30,14 +33,14 @@ model:
 
   # ターゲット予測用デコーダ（rkn_targetDecoder使用）
   target_decoder:
-    type: "rkn"                   # Factory Pattern
+    type: "rkn"                   # Factory Pattern: experiment_mode="target_prediction"でrkn_targetDecoder選択
     feature_dim: 50               # 入力潜在次元数
     state_dim: 8                  # 出力ターゲット次元数（制御状態）
     hidden: 50                    # 隠れ層次元数
     activation: "relu"            # 活性化関数
     output_activation: "tanh"     # 出力活性化関数（[-1,1]範囲）
 
-  # 画像再構成用デコーダ（互換性のため保持）
+  # 画像再構成用デコーダ（互換性のため保持、target_prediction時は未使用）
   decoder:
     type: "rkn"                   # Factory Pattern: rknDecoder選択
     input_resolution: [48, 48, 1] # 出力画像解像度 (H, W, C)
@@ -51,16 +54,21 @@ model:
 
 # 学習設定
 training:
-  # 統合学習設定 
+  # 以下は統合学習で未使用のため無効化
+  # max_epochs: 10           # 最大エポック数（統合学習では'epochs'を使用）
+  # learning_rate: 0.001     # 学習率（統合学習では個別学習率lr_phi等を使用）
+  # patience: 15             # Early stopping忍耐度（統合学習では未実装）
+
+  # 統合学習設定 (各エポックでPhase-1 + Phase-2を連続実行)
   epochs: 10               # 総エポック数
   T1_iterations: 5         # DF-A/DF-B Stage-1反復数（各エポック内）
   T2_iterations: 1          # DF-A/DF-B Stage-2反復数（各エポック内）
-  phase1_warmup_epochs: 5   # Phase-2開始前のPhase-1ウォームアップ
+  phase1_warmup_epochs: 5   # Phase-2(End-to-end)開始前のPhase-1(DF-A/DF-B)ウォームアップ
 
   # 実験モード設定
   experiment_mode: "target_prediction"  # Phase-2での動作切り替え
   target_loss_weight: 1.0              # ターゲット損失重み
-  reconstruction_loss_weight: 0.0      # 再構成損失重み
+  reconstruction_loss_weight: 0.0      # 再構成損失重み（未使用）
 
   # Phase-1関連学習率（各エポック内のDF学習用）
   lr_phi: 1e-3             # φ_θ (状態特徴) 学習率
@@ -73,6 +81,10 @@ training:
   lambda_cca: 0.0001        # CCA損失重み（特徴学習用、小さめ）
   update_strategy: "encoder_decoder_only"  # Phase-2はencoder/decoderのみ更新
 
+  # 画像再構成特有の設定（統合学習では未使用のため無効化）
+  # reconstruction:
+  #   loss_type: "mse"        # 再構成損失: mse, l1, ssim
+  #   perceptual_loss_weight: 0.0  # 知覚損失重み（必要に応じて）
 
 # SSM (状態空間モデル) 設定
 ssm:
@@ -84,18 +96,18 @@ ssm:
     jitter: 1e-6           # 数値安定化パラメータ
     m: 50                  # ラグ共分散推定サンプル数
 
-    # 特徴写像設定
+    # ======== 特徴写像設定 (Step 14追加) ========
     feature_mapping:
-      type: "averaging"      # "averaging" or "linear" or "mlp"
-      hidden_dims: []        # MLPの隠れ層
-      activation: "relu"     
+      type: "averaging"      # "averaging" | "linear" | "mlp"
+      hidden_dims: []        # MLPの隠れ層（[] で線形のみ、[32] で浅いMLP）
+      activation: "relu"     # "relu" | "tanh" | "gelu"
 
   # DF-A (状態層) 設定
   df_state:
-    feature_dim: 50         # d_A: 状態特徴次元
-    lambda_A: 1e-3          # V_A正則化パラメータ 
-    lambda_B: 1e-3          # U_A正則化パラメータ 
-    feature_net:            # StateFeatureNet 
+    feature_dim: 50         # d_A: 状態特徴次元 (R^r → R^{d_A})
+    lambda_A: 1e-3          # V_A正則化パラメータ (特異値爆発抑制のため強化)
+    lambda_B: 1e-3          # U_A正則化パラメータ (特異値爆発抑制のため強化)
+    feature_net:            # StateFeatureNet (φ_θ) 深層学習設定
       hidden_sizes: [128, 64]  # MLP隠れ層サイズ (画像用に大きめ)
       activation: "ReLU"       # 活性化関数
       dropout: 0.1             # ドロップアウト率 (過学習防止)
@@ -107,9 +119,9 @@ ssm:
   df_observation:
     obs_feature_dim: 25         # d_B: 観測特徴次元 (R^m → R^{d_B})
     multivariate_feature_dim: 50  # m: エンコーダー出力次元 (model.encoder.feature_dimと合わせる)
-    lambda_B: 1e-3              # V_B正則化パラメータ 
-    lambda_dB: 1e-3             # u_B正則化パラメータ 
-    obs_net:                    # ObservationFeatureNet
+    lambda_B: 1e-3              # V_B正則化パラメータ (特異値爆発抑制のため強化)
+    lambda_dB: 1e-3             # u_B正則化パラメータ (特異値爆発抑制のため強化)
+    obs_net:                    # ObservationFeatureNet (ψ_ω) 深層学習設定
       hidden_sizes: [64, 32]      # MLP隠れ層サイズ (観測用)
       activation: "ReLU"          # 活性化関数
       dropout: 0.1                # ドロップアウト率 (過学習防止)
@@ -138,9 +150,9 @@ logging:
 
 # 評価設定
 evaluation:
-  use_new_realization: true # 新確率実現使用
+  use_new_realization: true # 新しい確率実現使用 (StochasticRealizationWithEncoder)
 
-  # ターゲット予測評価指標
+  # ターゲット予測評価指標（ソースコード準拠: target_metrics）
   target_metrics:
     metrics: ["rmse", "mae", "r2"]       # 評価指標
     save_predictions: true               # 予測値保存
@@ -158,5 +170,5 @@ evaluation:
 
   # エンコード特徴空間可視化設定
   encoded_feature_space_viz:
-    dim_indices: [0, 1]     # 表示する次元のインデックス
-    max_samples: 100        # 最大表示サンプル数
+    dim_indices: [0, 1]     # 表示する次元のインデックス（デフォルト: 最初の2次元）
+    max_samples: 100        # 最大表示サンプル数（入力が少ない場合は入力データ長を使用）

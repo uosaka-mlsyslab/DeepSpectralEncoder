@@ -8,7 +8,9 @@ from typing import Union, Tuple, Dict, Any
 class ObservationNoiseCovarianceEstimator:
     """
     多変量観測ノイズ共分散推定器
-    残差 ρ_t := ψ_ω(m_t) - V_B φ_θ(x_t) から R ∈ R^{d_B × d_B} を推定・正則化
+
+    残差 ρ_t := ψ_ω(m_t) - V_B φ_θ(x_t) ∈ R^{d_B} から
+    サンプル共分散 R ∈ R^{d_B × d_B} を推定し、数値安定性のため正則化。
     """
 
     def __init__(
@@ -36,13 +38,15 @@ class ObservationNoiseCovarianceEstimator:
         return_stats: bool = False
     ) -> Union[torch.Tensor, Tuple[torch.Tensor, Dict[str, float]]]:
         """
-        残差からサンプル共分散推定
+        残差からサンプル共分散を推定
+
         Args:
-            residuals: (T, d_B)
+            residuals: 残差系列 (T, d_B)
             return_stats: 統計情報も返すか
+
         Returns:
-            R: 正則化済み共分散 (d_B, d_B)
-            stats: 統計情報 (オプション)
+            R: 正則化済み観測ノイズ共分散 (d_B, d_B)
+            stats: 統計情報（オプション）
         """
         if residuals.dim() != 2:
             raise ValueError(f"residuals must be 2D tensor (T, d_B), got shape: {residuals.shape}")
@@ -55,10 +59,10 @@ class ObservationNoiseCovarianceEstimator:
             raise ValueError(f"Too few samples for covariance estimation: T={T}")
 
         # サンプル共分散推定
-        residuals_centered = residuals - residuals.mean(dim=0, keepdim=True)
-        R_sample = (residuals_centered.T @ residuals_centered) / (T - 1)
+        residuals_centered = residuals - residuals.mean(dim=0, keepdim=True)  # (T, d_B)
+        R_sample = (residuals_centered.T @ residuals_centered) / (T - 1)  # (d_B, d_B)
 
-        # 正則化
+        # 正則化適用
         R_regularized = self.regularize_covariance(R_sample)
 
         if return_stats:
@@ -68,16 +72,18 @@ class ObservationNoiseCovarianceEstimator:
 
     def regularize_covariance(self, R_sample: torch.Tensor) -> torch.Tensor:
         """
-        共分散行列正則化
+        共分散行列の正則化
+
         Args:
-            R_sample: (d_B, d_B)
+            R_sample: サンプル共分散 (d_B, d_B)
+
         Returns:
-            R_regularized: (d_B, d_B)
+            R_regularized: 正則化済み共分散 (d_B, d_B)
         """
         # 対称性確保
         R_sample = (R_sample + R_sample.T) / 2
 
-        # 対角正則化: R = R_sample + γ_R * I
+        # 対角正則化: R = R_sample + γ_R * I_{d_B}
         R_regularized = R_sample + self.gamma_R * torch.eye(
             self.d_B, device=R_sample.device, dtype=R_sample.dtype
         )
@@ -85,6 +91,8 @@ class ObservationNoiseCovarianceEstimator:
         # 固有値分解による追加正則化
         try:
             eigenvalues, eigenvectors = torch.linalg.eigh(R_regularized)
+
+            # 負・小さい固有値をクリップ
             eigenvalues_clipped = torch.clamp(eigenvalues, min=self.min_eigenvalue)
 
             # 条件数制御
@@ -96,6 +104,7 @@ class ObservationNoiseCovarianceEstimator:
             R_final = eigenvectors @ torch.diag(eigenvalues_final) @ eigenvectors.T
 
         except torch.linalg.LinAlgError:
+            # フォールバック: より強い対角正則化
             warnings.warn("Eigenvalue decomposition failed, using stronger regularization")
             stronger_reg = max(self.gamma_R * 10, 1e-2)
             R_final = R_sample + stronger_reg * torch.eye(
@@ -112,10 +121,12 @@ class ObservationNoiseCovarianceEstimator:
     ) -> Dict[str, float]:
         """統計情報計算"""
         try:
+            # サンプル共分散の統計
             eigenvals_sample = torch.linalg.eigvals(R_sample).real
             cond_sample = eigenvals_sample.max() / eigenvals_sample.min()
             det_sample = torch.det(R_sample)
 
+            # 正則化後の統計
             eigenvals_reg = torch.linalg.eigvals(R_regularized).real
             cond_reg = eigenvals_reg.max() / eigenvals_reg.min()
             det_reg = torch.det(R_regularized)
@@ -141,16 +152,18 @@ class ObservationNoiseCovarianceEstimator:
     ) -> torch.Tensor:
         """
         観測特徴量と予測から直接推定
+
         Args:
-            psi_obs: (T, d_B)
-            psi_pred: (T, d_B)
+            psi_obs: 観測特徴量系列 (T, d_B)
+            psi_pred: 予測特徴量系列 (T, d_B)
+
         Returns:
-            R: (d_B, d_B)
+            R: 観測ノイズ共分散 (d_B, d_B)
         """
         if psi_obs.shape != psi_pred.shape:
             raise ValueError(f"Shape mismatch: psi_obs {psi_obs.shape} vs psi_pred {psi_pred.shape}")
 
-        residuals = psi_obs - psi_pred
+        residuals = psi_obs - psi_pred  # (T, d_B)
         return self.estimate_covariance(residuals)
 
     def adaptive_estimation(
@@ -160,13 +173,15 @@ class ObservationNoiseCovarianceEstimator:
         overlap: float = 0.5
     ) -> torch.Tensor:
         """
-        適応的共分散推定 (滑動窓)
+        適応的共分散推定（滑動窓）
+
         Args:
-            residuals: (T, d_B)
+            residuals: 残差系列 (T, d_B)
             window_size: 窓サイズ
             overlap: 重複率
+
         Returns:
-            R_adaptive: (d_B, d_B)
+            R_adaptive: 適応的観測ノイズ共分散 (d_B, d_B)
         """
         T = residuals.size(0)
         if T < window_size:
@@ -181,5 +196,6 @@ class ObservationNoiseCovarianceEstimator:
             R_window = self.estimate_covariance(window_residuals)
             covariance_estimates.append(R_window)
 
+        # 推定値の平均（より安定した推定）
         R_adaptive = torch.stack(covariance_estimates).mean(dim=0)
         return self.regularize_covariance(R_adaptive)

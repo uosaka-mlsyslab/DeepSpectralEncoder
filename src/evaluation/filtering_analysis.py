@@ -1,7 +1,8 @@
 """
-フィルタリング分析
+フィルタリング分析モジュール
 
-DFIV Kalman Filter性能を詳細分析し、ターミナル出力・数値保存
+DFIV Kalman Filterのフィルタリング性能を詳細に分析し、
+ターミナル出力と数値保存を行う。
 """
 
 import torch
@@ -42,16 +43,18 @@ class FilteringAnalyzer:
         verbose: bool = True
     ) -> Dict[str, Any]:
         """
-        フィルタリング性能包括分析
-
+        フィルタリング性能の包括的分析
+        
         Args:
             inference_model: 推論モデル
-            test_data: テストデータ (T,n)
-            true_states: 真値 (T,r)
+            test_data: テストデータ (T, n)
+            true_states: 真の状態 (T, r) [optional]
             experiment_name: 実験名
-            save_results: 保存フラグ
-            verbose: 詳細出力
-        Returns: 分析結果
+            save_results: 結果を保存するか
+            verbose: 詳細出力するか
+            
+        Returns:
+            Dict: 分析結果
         """
         if verbose:
             print(f"\n🚀 フィルタリング性能分析開始: {experiment_name}")

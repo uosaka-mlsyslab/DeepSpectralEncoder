@@ -6,7 +6,8 @@ import torch
 
 def load_data_npz(path: str):
     """
-    .npzファイルからX, Yを読み込みtorch.Tensorに変換
+    .npz ファイルから X, Y を読み込んで
+    numpy → torch.Tensor に変換して返します。
     """
     d = np.load(path)
     X = torch.from_numpy(d["X"].astype(np.float32))
@@ -21,26 +22,28 @@ def build_dataloaders(
     seed: int = 0,
 ):
     """
-    データをロードし、seq_length指定時は先頭を切り出して訓練/テストDataLoaderを返す
+    データをロードし、seq_length が指定されていれば
+    先頭 seq_length だけ切り出してから
+    訓練／テスト DataLoader を返します。
 
     Args:
-      data_path: .npzファイルパス
-      seq_length: None or 正の整数
+      data_path:   .npz ファイルへのパス
+      seq_length:  None or 正の整数
       train_ratio: 訓練データ比率
-      batch_size: ミニバッチサイズ
-      seed: 乱数シード
+      batch_size:  ミニバッチサイズ
+      seed:        乱数シード
     Returns:
       train_loader, test_loader
     """
-    # フルデータロード
-    X, Y = load_data_npz(data_path)
+    # 1) フルデータロード
+    X, Y = load_data_npz(data_path)      # shapes: (T, r), (T, d)
 
-    # 先頭を切り出す
+    # 2) 必要なら先頭を切り出す
     if seq_length is not None and seq_length < X.size(0):
         X = X[:seq_length]
         Y = Y[:seq_length]
 
-    # 訓練/テスト分割
+    # 3) 訓練／テスト分割
     N = X.size(0)
     idx = torch.arange(N)
     torch.manual_seed(seed)
@@ -52,7 +55,7 @@ def build_dataloaders(
     X_train, Y_train = X[idx_train], Y[idx_train]
     X_test,  Y_test  = X[idx_test],  Y[idx_test]
 
-    # DataLoader化
+    # 4) DataLoader 化
     train_ds = TensorDataset(X_train, Y_train)
     test_ds  = TensorDataset(X_test,  Y_test)
     train_loader = DataLoader(train_ds, batch_size=batch_size, shuffle=True)
